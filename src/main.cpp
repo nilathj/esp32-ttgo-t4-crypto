@@ -4,22 +4,32 @@
 #include <SPI.h>
 #include <TFT_eSPI.h>
 #include <WiFi.h>
+#include <WiFiManager.h>
 #include <atomic>
+#include <esp_random.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
+#include <strings.h>
 
 #include "Free_Fonts.h"
 #include "NotoSansBold15.h"
+#include "display_state.h"
 #include "quote_board.h"
 #include "quote_layout.h"
+#include "wifi_setup.h"
 
 #define AA_FONT_SMALL NotoSansBold15
-#define WIFI_SSID "xxxxx"
-#define WIFI_PASSWORD "xxxxx"
 
 #define MQTT_HOST IPAddress(192, 168, 0, 215)
 #define MQTT_PORT 1883
 #define MQTT_PRICE_TOPIC "crypto/prices"
+
+// The setup portal closes after this long, so a board that nobody provisions
+// does not sit there advertising an access point indefinitely.
+static constexpr unsigned long kPortalTimeoutSeconds = 300;
+
+// How long to try the stored network before offering the setup portal.
+static constexpr unsigned long kConnectTimeoutSeconds = 30;
 
 // A single status message larger than this is dropped instead of being parsed.
 // Messages longer than the MQTT receive buffer (1 KB) are still accepted: the
@@ -29,11 +39,27 @@ static constexpr size_t kMaxJsonBytes = 64 * 1024;
 
 TFT_eSPI tft = TFT_eSPI();
 PsychicMqttClient mqttClient;
+WiFiManager wifiManager;
 QueueHandle_t boardQueue = nullptr;
 
 static char mqttUri[64];
 static std::atomic<bool> wifiConnected{false};
 static bool mqttStarted = false;
+
+// The last payload received, kept so the table can be repainted after a link
+// transition instead of being replaced by a status message. The server publishes
+// with retain set, so a payload normally arrives the moment we subscribe.
+static quotes::Board lastBoard;
+static bool haveBoard = false;
+static display::Link shownLink = display::Link::Connecting;
+static bool linkDrawn = false;
+
+// Setup access point. The name is derived from the chip so several boards in
+// range can be told apart; the password is generated per boot and is never
+// compiled in. Credentials for the real network are never stored here: the
+// Wi-Fi stack keeps them in NVS (see the README).
+static char portalSsid[32];
+static char portalPassword[wifi_setup::kPasswordBufferSize];
 
 // Draws the coloured status bar with a single line of text.
 void drawStatus(const char *txt) {
@@ -43,6 +69,49 @@ void drawStatus(const char *txt) {
     tft.setTextDatum(TC_DATUM);
     tft.drawString(txt, tft.width() / 2, 2);
 }
+// Explains how to reach the setup portal, including the per-boot password.
+// Called from the portal callback, which runs on the Arduino task in blocking
+// mode, so touching the display here stays on the task that owns it.
+void drawProvisioningScreen() {
+    const int width = tft.width();
+    tft.fillScreen(TFT_BLACK);
+    tft.fillRect(0, 0, width, quotes::kStatusHeight, TFT_GREENYELLOW);
+    tft.setTextColor(TFT_BLACK, TFT_GREENYELLOW);
+    tft.setTextDatum(TC_DATUM);
+    tft.drawString("Wi-Fi setup", width / 2, 2);
+
+    const int left = quotes::kLayoutMargin;
+    const int lineHeight = tft.fontHeight(GFXFF) + 8;
+    int y = quotes::kStatusHeight + quotes::kHeaderPadTop + 6;
+
+    tft.setTextDatum(ML_DATUM);
+    tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+    tft.drawString("Join network:", left, y);
+    y += lineHeight;
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.drawString(portalSsid, left, y);
+    y += lineHeight;
+    tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+    tft.drawString("Password:", left, y);
+    y += lineHeight;
+    tft.setTextColor(TFT_CYAN, TFT_BLACK);
+    tft.drawString(portalPassword, left, y);
+    y += lineHeight + 4;
+    tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+    tft.drawString("Then open 192.168.4.1", left, y);
+}
+
+// Called by WiFiManager when the setup portal actually starts.
+void onPortalStarted(WiFiManager *) {
+    Serial.println("Wi-Fi setup portal started");
+    Serial.printf("  network:  %s\n", portalSsid);
+    // This is the one-time portal password, shown so it can be joined; the
+    // network passphrase the user types into the portal is never logged.
+    Serial.printf("  password: %s\n", portalPassword);
+    Serial.println("  open http://192.168.4.1 to configure");
+    drawProvisioningScreen();
+}
+
 
 // ---- Price table ----------------------------------------------------------
 
@@ -95,18 +164,25 @@ static quotes::Layout layoutFor(const quotes::Board &board) {
 // Draws a parsed snapshot. Only called from loop(), never from a network
 // callback, because the display writes take far longer than an MQTT callback
 // is allowed to block.
-void drawQuoteBoard(const quotes::Board &board) {
+//
+// `staleText` non-null means the connection is not live, so the header bar
+// carries that text (in a warning colour) instead of the payload timestamp. The
+// rows are always drawn, so prices are never hidden by a link transition.
+void drawQuoteBoard(const quotes::Board &board, const char *staleText) {
     const int width = tft.width();
     const int height = tft.height();
     const quotes::Layout layout = layoutFor(board);
     tft.fillScreen(TFT_BLACK);
 
-    // Timestamp bar.
-    tft.fillRect(0, 0, width, quotes::kStatusHeight, TFT_GREENYELLOW);
-    if (board.time[0] != '\0') {
-        tft.setTextColor(TFT_BLACK, TFT_GREENYELLOW);
+    // Header bar: payload timestamp when live, link status when stale.
+    const bool stale = staleText != nullptr && staleText[0] != '\0';
+    const uint16_t barBg = stale ? TFT_ORANGE : TFT_GREENYELLOW;
+    const char *barText = stale ? staleText : board.time;
+    tft.fillRect(0, 0, width, quotes::kStatusHeight, barBg);
+    if (barText[0] != '\0') {
+        tft.setTextColor(TFT_BLACK, barBg);
         tft.setTextDatum(TC_DATUM);
-        tft.drawString(board.time, width / 2, 2);
+        tft.drawString(barText, width / 2, 2);
     }
 
     // Column labels, in the same columns as the data below them. They sit in
@@ -171,9 +247,46 @@ void drawQuoteBoard(const quotes::Board &board) {
     }
 }
 
-void connectToWifi() {
-    Serial.println("Connecting to Wi-Fi...");
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+// Serial console: typing "reset" erases the saved network so the next boot
+// offers the setup portal again. This is the way to move the board to another
+// network without erasing the whole flash.
+void pollSerialCommands() {
+    static char line[24];
+    static size_t length = 0;
+
+    while (Serial.available() > 0) {
+        const int c = Serial.read();
+        if (c < 0)
+            break;
+        if (c == '\r' || c == '\n') {
+            line[length] = '\0';
+            if (length > 0 && strcasecmp(line, "reset") == 0) {
+                Serial.println("Erasing saved Wi-Fi credentials; restarting");
+                wifiManager.resetSettings();
+                delay(200);
+                ESP.restart();
+            }
+            length = 0;
+        } else if (length + 1 < sizeof(line)) {
+            line[length++] = static_cast<char>(c);
+        } else {
+            length = 0; // overlong input: drop the line
+        }
+    }
+}
+
+// Single entry point for painting the screen. Both the price table and the link
+// status go through here, so the two can never fight over the display: once a
+// payload has arrived it stays on screen, and a link transition only changes the
+// header bar. See include/display_state.h for the rule.
+void renderView(display::Link link) {
+    const display::View view = display::chooseView(link, haveBoard);
+    if (!view.showTable) {
+        drawStatus(display::statusText(link));
+        return;
+    }
+    drawQuoteBoard(lastBoard,
+                   view.barIsStatus ? display::statusText(link) : nullptr);
 }
 
 void WiFiEvent(WiFiEvent_t event) {
@@ -279,48 +392,96 @@ void setup() {
 
     WiFi.onEvent(WiFiEvent);
     WiFi.setAutoReconnect(true);
-    connectToWifi();
+
+    // ---- Wi-Fi provisioning ----
+    // Credentials are entered once through a captive portal and saved by the
+    // ESP32 Wi-Fi stack in NVS, so nothing about the network is compiled into
+    // the firmware or committed to this repository.
+    wifi_setup::makePassword(portalPassword, sizeof(portalPassword),
+                             []() { return esp_random(); });
+    if (!wifi_setup::isAcceptablePassword(portalPassword)) {
+        // Fail closed: an access point with a password WPA2 rejects is an open
+        // access point, so never advertise one.
+        Serial.println("Setup password rejected; refusing to open the portal");
+        drawStatus("Setup password error");
+        return;
+    }
+
+    const uint64_t chipId = ESP.getEfuseMac();
+    snprintf(portalSsid, sizeof(portalSsid), "TTGO-Crypto-%02X%02X",
+             static_cast<unsigned>((chipId >> 8) & 0xFF),
+             static_cast<unsigned>(chipId & 0xFF));
+
+    wifiManager.setAPCallback(onPortalStarted);
+    wifiManager.setConfigPortalTimeout(kPortalTimeoutSeconds);
+    wifiManager.setConnectTimeout(kConnectTimeoutSeconds);
+    wifiManager.setMinimumSignalQuality(10);
+    wifiManager.setHostname("ttgo-t4-crypto");
+    wifiManager.setTitle("TTGO T4 crypto prices");
+    // WiFiManager logs its arguments at the verbose/dev levels, which can
+    // include the passphrase; keep its serial output off.
+    wifiManager.setDebugOutput(false);
+
+    drawStatus("Connecting to Wi-Fi..");
+    // Connects with the saved network if there is one, otherwise (or if that
+    // fails) raises the setup portal and blocks until it is done or times out.
+    if (!wifiManager.autoConnect(portalSsid, portalPassword)) {
+        Serial.println("Wi-Fi not configured; restarting to offer setup again");
+        drawStatus("Wi-Fi setup timed out");
+        delay(2000);
+        ESP.restart();
+    }
+
+    // autoConnect() returning true means we are associated. Set the flag here as
+    // well, so the loop cannot miss a GOT_IP event that was raised while the
+    // stack was coming up.
+    if (WiFi.status() == WL_CONNECTED)
+        wifiConnected.store(true);
 }
 
 void loop() {
-    // Link status is drawn here, in the same task that owns the display.
-    static uint8_t lastLink = 0xff;
-    static bool everConnected = false;
+    pollSerialCommands();
+
+    // Read the payload first, so a message that arrives in the same pass as a
+    // link change is drawn by the repaint below rather than being overwritten
+    // by it.
+    bool boardUpdated = false;
+    if (boardQueue != nullptr) {
+        quotes::Board board;
+        if (xQueueReceive(boardQueue, &board, pdMS_TO_TICKS(100)) == pdPASS) {
+            lastBoard = board;
+            haveBoard = true;
+            boardUpdated = true;
+        }
+    } else {
+        delay(100);
+    }
+
     const bool mqttUp = mqttClient.connected();
     const bool wifiUp = wifiConnected.load();
+    static bool everConnected = false;
     if (wifiUp)
         everConnected = true;
 
-    // 0 = connecting, 1 = Wi-Fi up, 2 = MQTT up, 3 = Wi-Fi lost
-    const uint8_t link = mqttUp ? 2 : (wifiUp ? 1 : (everConnected ? 3 : 0));
-    if (link != lastLink) {
-        lastLink = link;
-        switch (link) {
-        case 2:
-            drawStatus("MQTT Connected..");
-            break;
-        case 1:
-            drawStatus("WIFI Connected..");
-            break;
-        case 3:
-            drawStatus("WIFI Disconnected..");
-            break;
-        default:
-            drawStatus("Connecting to Wi-Fi..");
-            break;
-        }
-    }
+    display::Link link = display::Link::Connecting;
+    if (mqttUp)
+        link = display::Link::MqttUp;
+    else if (wifiUp)
+        link = display::Link::WifiUp;
+    else if (everConnected)
+        link = display::Link::Lost;
+
+    const bool linkChanged = !linkDrawn || link != shownLink;
+    shownLink = link;
+    linkDrawn = true;
+
+    // One repaint decision for both triggers, so the status can never paint
+    // over data that has already arrived.
+    if (boardUpdated || linkChanged)
+        renderView(link);
 
     if (wifiUp && !mqttStarted) {
         mqttStarted = true;
         mqttClient.connect();
-    }
-
-    if (boardQueue != nullptr) {
-        quotes::Board board;
-        if (xQueueReceive(boardQueue, &board, pdMS_TO_TICKS(100)) == pdPASS)
-            drawQuoteBoard(board);
-    } else {
-        delay(100);
     }
 }

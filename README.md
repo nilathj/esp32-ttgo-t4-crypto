@@ -32,12 +32,14 @@ This is decided per message, so it depends on the data: values such as
 `2.2%` leave room. A coin name too long for its column is shortened with `..`.
 
 ## Prerequisites
-* This code is using platformio with TFT_eSPI, PsychicMqttClient and ArduinoJson 7 libraries.  Remember to install these libraries first. Refer platformio.ini.
+* This code is using platformio with TFT_eSPI, PsychicMqttClient, WiFiManager and ArduinoJson 7 libraries.  Remember to install these libraries first. Refer platformio.ini.
 * A MQTT server publishing price JSON payloads to the MQTT_PRICE_TOPIC (crypto/prices) periodically. Refer to [Crypto price server](https://github.com/nilathj/crypto-price-server)
-* Remember to set the WIFI SSID and password in main.cpp
+
+No WiFi details are stored in this repository or in the firmware. They are
+entered once on the device, see [Wi-Fi provisioning](#wi-fi-provisioning).
 
 ## Crypto price display code
-1. Connect to wifi
+1. Get Wi-Fi credentials from NVS, or from the setup portal on first boot
 2. Connect to MQTT server
 3. Subscribe to MQTT_PRICE_TOPIC with `mqttClient.onTopic()`
 4. onMqttMessage (MQTT client task)
@@ -45,6 +47,60 @@ This is decided per message, so it depends on the data: values such as
    - Hand the snapshot to the Arduino loop task
 5. loop task
    - Display crypto price data on the TFT using TFT_eSPI library.
+
+## Wi-Fi provisioning
+Nothing about your network is compiled into the firmware. On first boot the
+board has no saved network, so it raises its own access point and shows the
+details on the LCD:
+
+```
+        Wi-Fi setup
+Join network:  TTGO-Crypto-3F21
+Password:      K7M2QX94AB3Z
+Then open 192.168.4.1
+```
+
+Join that network from a phone or laptop, open `http://192.168.4.1`, pick your
+network from the scan and enter its passphrase. The board saves it and connects.
+The same details are printed to the serial monitor.
+
+The access point name ends in two bytes of the chip ID so several boards in
+range can be told apart. Its password is **generated fresh on every boot** from
+the hardware RNG, so no shared default password exists anywhere, and it is never
+stored. The portal closes after 5 minutes; if it closes unconfigured the board
+restarts and offers it again.
+
+### Changing or forgetting the network
+- Type `reset` on the serial monitor: erases the saved network and restarts into
+  the setup portal.
+- Or use the *erase* button on the portal's info page (reachable only while the
+  portal is open), then power-cycle.
+- Or `pio run -t erase` to wipe the whole flash.
+
+So the board can be moved to another network without a reflash, and no sketch
+edit is needed for a new deployment.
+
+### Where the credentials live, and what that does and does not protect
+`WiFiManager` hands the passphrase to the ESP32 Wi-Fi stack, which stores it in
+NVS (`nvs.net80211`) in flash. Consequences worth being explicit about:
+
+- The passphrase is **not** in the source tree and **not** in `firmware.bin`, so
+  it cannot leak through Git, a shared build artefact or a screenshot of
+  `main.cpp`.
+- NVS is **not encrypted by default**. Anyone with the board in hand and USB
+  access can dump flash with `esptool.py read_flash` and read the passphrase
+  back. Treat a stolen board as a leaked Wi-Fi password.
+- Real at-rest protection is ESP32 **flash encryption**, which encrypts NVS with
+  a key held in eFuse. That is a device-provisioning step (custom partition table
+  plus `CONFIG_SECURE_FLASH_ENC_ENABLED`, and it is irreversible once the eFuse
+  is burned); it is not something this firmware does, because enabling it behind
+  your back would be destructive.
+- Deliberately not done: obfuscating the passphrase with a key derived from the
+  chip MAC or a hardcoded constant. That is security theatre — the key ships in
+  the same flash image the attacker already has.
+
+The MQTT broker address is still a compile-time constant in `main.cpp`; only the
+Wi-Fi details are provisioned so far.
 
 ## Large payloads
 MQTT payloads larger than the client's 1 KB receive buffer arrive in several
@@ -68,11 +124,37 @@ messages larger than the free heap can still exhaust the client; keep the
 payload to what the display can use, or cap it on the broker
 (e.g. mosquitto `message_size_limit`).
 
+## When prices appear
+Prices show up as soon as MQTT is connected, not at the next scheduled publish.
+The price server publishes with `retain=True`, so the broker keeps the latest
+payload and delivers it immediately to a new subscriber.
+
+Because two things want to paint the screen — the connection status and the
+price table — the view decision is centralised in `include/display_state.h` and
+repainted from one place in `loop()`:
+
+- before any payload arrives, the screen shows connection status;
+- once a payload has arrived it stays on screen, and a link transition only
+  changes the header bar (orange, with the link status) so the prices remain
+  visible and are marked stale rather than erased;
+- a new payload always wins, and the bar returns to the payload timestamp.
+
+Previously the status and the table were drawn independently, so the
+`MQTT Connected..` transition could paint over a table drawn moments earlier; the
+next table then only appeared at the server's next 5-minute cron run.
+
 ## Tests
-Host tests run against the same headers the firmware compiles: the payload
-parser (`test_quote_board`, including a 68 KB payload that is deliberately not
-null-terminated) and the table geometry (`test_quote_layout`, including the
-volume-column drop rule and the rows-per-screen calculation):
+Host tests run against the same headers the firmware compiles:
+
+- `test_quote_board` — the payload parser, including a 68 KB payload that is
+  deliberately not null-terminated.
+- `test_quote_layout` — the table geometry: the volume-column drop rule,
+  rows-per-screen, header spacing, and name truncation bounds.
+- `test_wifi_setup` — the setup-portal password (always WPA2-acceptable, no
+  confusable characters, unbiased over the whole alphabet, distinct per draw)
+  and the log redaction helper.
+- `test_display_state` — the screen view rule: prices already on screen must
+  never be replaced by a connection-status message.
 
 ```
 pio test -e native
